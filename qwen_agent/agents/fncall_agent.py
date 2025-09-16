@@ -74,6 +74,8 @@ class FnCallAgent(Agent):
         messages = copy.deepcopy(messages)
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         response = []
+        # Global counter for <source id="n"> blocks across multiple tool calls in one run
+        global_source_id_counter: int = 0
         while True and num_llm_calls_available > 0:
             num_llm_calls_available -= 1
 
@@ -95,10 +97,18 @@ class FnCallAgent(Agent):
                     use_tool, tool_name, tool_args, _ = self._detect_tool(out)
                     if use_tool:
                         tool_result = self._call_tool(tool_name, tool_args, messages=messages, **kwargs)
+                        # Renumber <source id="..."> blocks to be globally unique within this run
+                        try:
+                            tool_result, inc = self._renumber_source_blocks(tool_result, start_index=global_source_id_counter + 1)
+                            global_source_id_counter += inc
+                        except Exception:
+                            # If anything goes wrong during renumbering, fall back to original content
+                            pass
                         fn_msg = Message(role=FUNCTION,
                                          name=tool_name,
                                          content=tool_result,
                                          extra={'function_id': out.extra.get('function_id', '1')})
+                        
                         messages.append(fn_msg)
                         response.append(fn_msg)
                         yield response
@@ -118,3 +128,36 @@ class FnCallAgent(Agent):
             return super()._call_tool(tool_name, tool_args, files=files, **kwargs)
         else:
             return super()._call_tool(tool_name, tool_args, **kwargs)
+
+    def _renumber_source_blocks(self, text: str, start_index: int) -> tuple[str, int]:
+        """Renumber <source id="n"> blocks so that ids are globally unique.
+
+        Args:
+            text: The tool result text that may contain multiple <source id="..."> blocks.
+            start_index: The starting index (1-based) to assign to the first encountered source block.
+
+        Returns:
+            A pair of (new_text, count) where new_text has ids rewritten to be
+            consecutive starting from start_index, and count is the number of
+            source blocks found and rewritten.
+        """
+        import re
+
+        if not isinstance(text, str) or '<source' not in text:
+            return text, 0
+
+        pattern = re.compile(r"(<source\s+id=\")([0-9]+)(\">)")
+
+        # We will replace sequentially in appearance order with start_index..
+        current = start_index
+        count = 0
+
+        def _repl(m: 're.Match[str]') -> str:
+            nonlocal current, count
+            count += 1
+            repl = f"{m.group(1)}{current}{m.group(3)}"
+            current += 1
+            return repl
+
+        new_text = pattern.sub(_repl, text)
+        return new_text, count
