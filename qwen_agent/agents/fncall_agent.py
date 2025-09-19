@@ -93,9 +93,27 @@ class FnCallAgent(Agent):
                 response.extend(output)
                 messages.extend(output)
                 used_any_tool = False
+                
+                # Check if there's a reranker-rerank tool call in output
+                has_rerank_tool = False
+                rerank_tool_calls = []
+                other_tool_calls = []
+                
                 for out in output:
                     use_tool, tool_name, tool_args, _ = self._detect_tool(out)
                     if use_tool:
+                        if tool_name == 'reranker-rerank':
+                            has_rerank_tool = True
+                            rerank_tool_calls.append((out, tool_name, tool_args))
+                        else:
+                            other_tool_calls.append((out, tool_name, tool_args))
+                
+                if has_rerank_tool:
+                    # Special handling for reranker-rerank: collect search results in buffer
+                    search_results_buffer = []
+                    
+                    # First execute all non-rerank tools and collect their results
+                    for out, tool_name, tool_args in other_tool_calls:
                         tool_result = self._call_tool(tool_name, tool_args, messages=messages, **kwargs)
                         # Renumber <source id="..."> blocks to be globally unique within this run
                         try:
@@ -104,6 +122,38 @@ class FnCallAgent(Agent):
                         except Exception:
                             # If anything goes wrong during renumbering, fall back to original content
                             pass
+                        
+                        # Add to buffer for later use in rerank
+                        search_results_buffer.append(tool_result)
+                        
+                        # Create Message with placeholder content and add to messages/response
+                        fn_msg = Message(role=FUNCTION,
+                                         name=tool_name,
+                                         content="见重排结果",
+                                         extra={'function_id': out.extra.get('function_id', '1')})
+                        
+                        messages.append(fn_msg)
+                        response.append(fn_msg)
+                        yield response
+                        used_any_tool = True
+                    
+                    # Then execute rerank tools with concatenated search results
+                    for out, tool_name, tool_args in rerank_tool_calls:
+                        # Parse tool_args and add concatenated search results
+                        import json
+                        if isinstance(tool_args, str):
+                            args_dict = json.loads(tool_args)
+                        else:
+                            args_dict = tool_args.copy()
+                        
+                        # Concatenate all search results as search_results parameter
+                        concatenated_results = '\n\n'.join(search_results_buffer)
+                        args_dict['search_results'] = concatenated_results
+                        
+                        # Call rerank tool with modified arguments
+                        tool_result = self._call_tool(tool_name, json.dumps(args_dict), messages=messages, **kwargs)
+                        
+                        # Create Message for rerank result and add to messages/response
                         fn_msg = Message(role=FUNCTION,
                                          name=tool_name,
                                          content=tool_result,
@@ -113,6 +163,28 @@ class FnCallAgent(Agent):
                         response.append(fn_msg)
                         yield response
                         used_any_tool = True
+                else:
+                    # Original logic for cases without reranker-rerank
+                    for out in output:
+                        use_tool, tool_name, tool_args, _ = self._detect_tool(out)
+                        if use_tool:
+                            tool_result = self._call_tool(tool_name, tool_args, messages=messages, **kwargs)
+                            # Renumber <source id="..."> blocks to be globally unique within this run
+                            try:
+                                tool_result, inc = self._renumber_source_blocks(tool_result, start_index=global_source_id_counter + 1)
+                                global_source_id_counter += inc
+                            except Exception:
+                                # If anything goes wrong during renumbering, fall back to original content
+                                pass
+                            fn_msg = Message(role=FUNCTION,
+                                             name=tool_name,
+                                             content=tool_result,
+                                             extra={'function_id': out.extra.get('function_id', '1')})
+                            
+                            messages.append(fn_msg)
+                            response.append(fn_msg)
+                            yield response
+                            used_any_tool = True
                 if not used_any_tool:
                     break
         yield response
